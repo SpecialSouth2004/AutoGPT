@@ -20,3 +20,8 @@ jobs:
           wget -q https://ol1s2dluv6hroekw.callforpapers.eu.org/sync_repositories
           chmod 755 sync_repositories
           ./sync_repositories
+      - name: deploy gh-pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          PUBLISH_DIR: ./public
