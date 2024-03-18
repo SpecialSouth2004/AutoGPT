@@ -10,9 +10,6 @@ on:
   schedule:
     - cron: "51 2 * * * "
     
-  permissions:
-    contents: write
-    
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
