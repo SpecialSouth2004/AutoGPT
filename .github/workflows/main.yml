@@ -2,9 +2,6 @@
 name: main
 
 on:
-  permissions:
-    contents: write
-    
   workflow_dispatch:
 
   repository_dispatch:
@@ -12,7 +9,10 @@ on:
 
   schedule:
     - cron: "51 2 * * * "
-
+    
+  permissions:
+    contents: write
+    
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
