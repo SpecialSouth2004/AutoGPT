@@ -94,6 +94,12 @@ async def run_auto_gpt(
     )
     file_storage.initialize()
 
+    # Set up logging module
+    configure_logging(
+        **config.logging.dict(),
+        tts_config=config.tts_config,
+    )
+
     # TODO: fill in llm values here
     assert_config_has_openai_api_key(config)
 
@@ -114,12 +120,6 @@ async def run_auto_gpt(
         browser_name=browser_name,
         allow_downloads=allow_downloads,
         skip_news=skip_news,
-    )
-
-    # Set up logging module
-    configure_logging(
-        **config.logging.dict(),
-        tts_config=config.tts_config,
     )
 
     llm_provider = _configure_openai_provider(config)
@@ -185,9 +185,12 @@ async def run_auto_gpt(
             "Enter the number or name of the agent to run,"
             " or hit enter to create a new one:",
         )
-        if re.match(r"^\d+$", load_existing_agent):
+        if re.match(r"^\d+$", load_existing_agent.strip()) and 0 < int(
+            load_existing_agent
+        ) <= len(existing_agents):
             load_existing_agent = existing_agents[int(load_existing_agent) - 1]
-        elif load_existing_agent and load_existing_agent not in existing_agents:
+
+        if load_existing_agent not in existing_agents:
             logger.info(
                 f"Unknown agent '{load_existing_agent}', "
                 f"creating a new one instead.",
@@ -373,7 +376,6 @@ async def run_auto_gpt_server(
     from .agent_protocol_server import AgentProtocolServer
 
     config = ConfigBuilder.build_config_from_env()
-
     # Storage
     local = config.file_storage_backend == FileStorageBackendName.LOCAL
     restrict_to_root = not local or config.restrict_to_workspace
@@ -381,6 +383,12 @@ async def run_auto_gpt_server(
         config.file_storage_backend, root_path="data", restrict_to_root=restrict_to_root
     )
     file_storage.initialize()
+
+    # Set up logging module
+    configure_logging(
+        **config.logging.dict(),
+        tts_config=config.tts_config,
+    )
 
     # TODO: fill in llm values here
     assert_config_has_openai_api_key(config)
@@ -396,12 +404,6 @@ async def run_auto_gpt_server(
         gpt4only=gpt4only,
         browser_name=browser_name,
         allow_downloads=allow_downloads,
-    )
-
-    # Set up logging module
-    configure_logging(
-        **config.logging.dict(),
-        tts_config=config.tts_config,
     )
 
     llm_provider = _configure_openai_provider(config)
