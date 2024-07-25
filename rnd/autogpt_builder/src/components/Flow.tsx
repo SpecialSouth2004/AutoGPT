@@ -84,6 +84,8 @@ const FlowEditor: React.FC<{
   const [savedAgent, setSavedAgent] = useState<Graph | null>(null);
   const [agentDescription, setAgentDescription] = useState<string>('');
   const [agentName, setAgentName] = useState<string>('');
+  const [copiedNodes, setCopiedNodes] = useState<Node<CustomNodeData>[]>([]);
+  const [copiedEdges, setCopiedEdges] = useState<Edge<CustomEdgeData>[]>([]);
 
   const apiUrl = process.env.AGPT_SERVER_URL!;
   const api = useMemo(() => new AutoGPTServerAPI(apiUrl), [apiUrl]);
@@ -464,6 +466,68 @@ const FlowEditor: React.FC<{
   };
 
   const toggleSidebar = () => setIsSidebarOpen(!isSidebarOpen);
+
+  const handleKeyDown = useCallback((event: KeyboardEvent) => {
+    if (event.ctrlKey || event.metaKey) {
+      if (event.key === 'c' || event.key === 'C') {
+        // Copy selected nodes
+        const selectedNodes = nodes.filter(node => node.selected);
+        const selectedEdges = edges.filter(edge => edge.selected);
+        setCopiedNodes(selectedNodes);
+        setCopiedEdges(selectedEdges);
+      }
+      if (event.key === 'v' || event.key === 'V') {
+        // Paste copied nodes
+        if (copiedNodes.length > 0) {
+          const newNodes = copiedNodes.map((node, index) => {
+            const newNodeId = (nodeId + index).toString();
+            return {
+              ...node,
+              id: newNodeId,
+              position: {
+                x: node.position.x + 20, // Offset pasted nodes
+                y: node.position.y + 20,
+              },
+              data: {
+                ...node.data,
+                status: undefined, // Reset status
+                output_data: undefined, // Clear output data
+                setHardcodedValues: (values: { [key: string]: any }) => {
+                  setNodes((nds) => nds.map((n) =>
+                    n.id === newNodeId
+                      ? { ...n, data: { ...n.data, hardcodedValues: values } }
+                      : n
+                  ));
+                },
+              },
+            };
+          });
+          const updatedNodes = nodes.map(node => ({ ...node, selected: false })); // Deselect old nodes
+          setNodes([...updatedNodes, ...newNodes]);
+          setNodeId(prevId => prevId + copiedNodes.length);
+
+          const newEdges = copiedEdges.map(edge => {
+            const newSourceId = newNodes.find(n => n.data.title === edge.source)?.id || edge.source;
+            const newTargetId = newNodes.find(n => n.data.title === edge.target)?.id || edge.target;
+            return {
+              ...edge,
+              id: `${newSourceId}_${edge.sourceHandle}_${newTargetId}_${edge.targetHandle}_${Date.now()}`,
+              source: newSourceId,
+              target: newTargetId,
+            };
+          });
+          setEdges([...edges, ...newEdges]);
+        }
+      }
+    }
+  }, [nodes, edges, copiedNodes, copiedEdges, nodeId]);
+
+  useEffect(() => {
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [handleKeyDown]);
 
   return (
     <div className={className}>
