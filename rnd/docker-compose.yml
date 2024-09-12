@@ -30,7 +30,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      - DATABASE_URL=postgresql://agpt_user:pass123@postgres:5432/agpt_local
+      - DATABASE_URL=postgresql://agpt_user:pass123@postgres:5432/agpt_local?connect_timeout=60
     networks:
       - app-network
     restart: on-failure
@@ -49,7 +49,7 @@ services:
     networks:
       - app-network
 
-  api_srv:
+  rest_server:
     image: autogpt_server:latest
     command: ["poetry", "run", "rest"]
     develop:
@@ -65,14 +65,13 @@ services:
       migrate:
         condition: service_started
     environment:
-      - DATABASE_URL=postgresql://agpt_user:pass123@postgres:5432/agpt_local
+      - DATABASE_URL=postgresql://agpt_user:pass123@postgres:5432/agpt_local?connect_timeout=60
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=password
       - AUTH_ENABLED=false
       - PYRO_HOST=0.0.0.0
       - EXECUTIONMANAGER_HOST=executor
-      - PORT=8000
     ports:
       - "8000:8000"
       - "8003:8003" # execution scheduler
@@ -95,20 +94,19 @@ services:
       migrate:
         condition: service_started
     environment:
-      - DATABASE_URL=postgresql://agpt_user:pass123@postgres:5432/agpt_local
+      - DATABASE_URL=postgresql://agpt_user:pass123@postgres:5432/agpt_local?connect_timeout=60
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=password
       - AUTH_ENABLED=false
       - PYRO_HOST=0.0.0.0
-      - AGENTSERVER_HOST=api_srv
-      - PORT=8002
+      - AGENTSERVER_HOST=rest_server
     ports:
-      - "8002:8002"
+      - "8002:8000"
     networks:
       - app-network
 
-  ws_srv:
+  websocket_server:
     image: autogpt_server:latest
     command: ["poetry", "run", "ws"]
     develop:
@@ -121,15 +119,14 @@ services:
       - redis
       - migrate
     environment:
-      - DATABASE_URL=postgresql://agpt_user:pass123@postgres:5432/agpt_local
+      - DATABASE_URL=postgresql://agpt_user:pass123@postgres:5432/agpt_local?connect_timeout=60
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=password
       - AUTH_ENABLED=false
       - PYRO_HOST=0.0.0.0
-      - PORT=8001
     ports:
-      - "8001:8001"
+      - "8001:8000"
     networks:
       - app-network
 
@@ -141,7 +138,7 @@ services:
       - postgres
       - migrate
     environment:
-      - DATABASE_URL=postgresql://agpt_user:pass123@postgres:5432/agpt_local
+      - DATABASE_URL=postgresql://agpt_user:pass123@postgres:5432/agpt_local?connect_timeout=60
     ports:
       - "8015:8015"
     networks:
@@ -154,11 +151,11 @@ services:
       target: dev
     depends_on:
       - postgres
-      - api_srv
-      - ws_srv
+      - rest_server
+      - websocket_server
       - migrate
     environment:
-      - DATABASE_URL=postgresql://agpt_user:pass123@postgres:5432/agpt_local
+      - DATABASE_URL=postgresql://agpt_user:pass123@postgres:5432/agpt_local?connect_timeout=60
       - NEXT_PUBLIC_AGPT_SERVER_URL=http://localhost:8000/api
       - NEXT_PUBLIC_AGPT_WS_SERVER_URL=ws://localhost:8001/ws
       - NEXT_PUBLIC_AGPT_MARKETPLACE_URL=http://localhost:8015/api/v1/market
