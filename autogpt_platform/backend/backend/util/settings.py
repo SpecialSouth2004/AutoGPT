@@ -148,6 +148,11 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         description="What environment to behave as: local or cloud",
     )
 
+    execution_event_bus_name: str = Field(
+        default="execution_event",
+        description="Name of the event bus",
+    )
+
     backend_cors_allow_origins: List[str] = Field(default_factory=list)
 
     @field_validator("backend_cors_allow_origins")
@@ -202,6 +207,8 @@ class Secrets(UpdateTrackingModel["Secrets"], BaseSettings):
     supabase_service_role_key: str = Field(
         default="", description="Supabase service role key"
     )
+
+    encryption_key: str = Field(default="", description="Encryption key")
 
     # OAuth server credentials for integrations
     # --8<-- [start:OAuthServerCredentialsExample]
