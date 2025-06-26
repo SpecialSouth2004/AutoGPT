@@ -14,6 +14,12 @@ class FileStoreBlock(Block):
         file_in: MediaFileType = SchemaField(
             description="The file to store in the temporary directory, it can be a URL, data URI, or local path."
         )
+        base_64: bool = SchemaField(
+            description="Whether produce an output in base64 format (not recommended, you can pass the string path just fine accross blocks).",
+            default=False,
+            advanced=True,
+            title="Produce Base64 Output",
+        )
 
     class Output(BlockSchema):
         file_out: MediaFileType = SchemaField(
@@ -37,12 +43,11 @@ class FileStoreBlock(Block):
         graph_exec_id: str,
         **kwargs,
     ) -> BlockOutput:
-        file_path = await store_media_file(
+        yield "file_out", await store_media_file(
             graph_exec_id=graph_exec_id,
             file=input_data.file_in,
-            return_content=False,
+            return_content=input_data.base_64,
         )
-        yield "file_out", file_path
 
 
 class StoreValueBlock(Block):
@@ -456,6 +461,11 @@ class CreateListBlock(Block):
             description="A list of values to be combined into a new list.",
             placeholder="e.g., ['Alice', 25, True]",
         )
+        max_size: int | None = SchemaField(
+            default=None,
+            description="Maximum size of the list. If provided, the list will be yielded in chunks of this size.",
+            advanced=True,
+        )
 
     class Output(BlockSchema):
         list: List[Any] = SchemaField(
@@ -492,8 +502,9 @@ class CreateListBlock(Block):
 
     async def run(self, input_data: Input, **kwargs) -> BlockOutput:
         try:
-            # The values are already validated by Pydantic schema
-            yield "list", input_data.values
+            max_size = input_data.max_size or len(input_data.values)
+            for i in range(0, len(input_data.values), max_size):
+                yield "list", input_data.values[i : i + max_size]
         except Exception as e:
             yield "error", f"Failed to create list: {str(e)}"
 
