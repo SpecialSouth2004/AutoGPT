@@ -5,8 +5,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 import aio_pika
-from aio_pika.exceptions import QueueEmpty
-from autogpt_libs.utils.cache import thread_cached
 from prisma.enums import NotificationType
 
 from backend.data import rabbitmq
@@ -27,26 +25,14 @@ from backend.data.notifications import (
     get_notif_data_type,
     get_summary_params_type,
 )
-from backend.data.rabbitmq import (
-    AsyncRabbitMQ,
-    Exchange,
-    ExchangeType,
-    Queue,
-    RabbitMQConfig,
-    SyncRabbitMQ,
-)
+from backend.data.rabbitmq import Exchange, ExchangeType, Queue, RabbitMQConfig
 from backend.data.user import generate_unsubscribe_link
 from backend.notifications.email import EmailSender
+from backend.util.clients import get_database_manager_client
 from backend.util.logging import TruncatedLogger
 from backend.util.metrics import discord_send_alert
 from backend.util.retry import continuous_retry
-from backend.util.service import (
-    AppService,
-    AppServiceClient,
-    endpoint_to_sync,
-    expose,
-    get_service_client,
-)
+from backend.util.service import AppService, AppServiceClient, endpoint_to_sync, expose
 from backend.util.settings import Settings
 
 logger = TruncatedLogger(logging.getLogger(__name__), "[NotificationManager]")
@@ -117,27 +103,6 @@ def create_notification_config() -> RabbitMQConfig:
     )
 
 
-@thread_cached
-def get_db():
-    from backend.executor.database import DatabaseManagerClient
-
-    return get_service_client(DatabaseManagerClient)
-
-
-@thread_cached
-def get_notification_queue() -> SyncRabbitMQ:
-    client = SyncRabbitMQ(create_notification_config())
-    client.connect()
-    return client
-
-
-@thread_cached
-async def get_async_notification_queue() -> AsyncRabbitMQ:
-    client = AsyncRabbitMQ(create_notification_config())
-    await client.connect()
-    return client
-
-
 def get_routing_key(event_type: NotificationType) -> str:
     strategy = NotificationTypeOverride(event_type).strategy
     """Get the appropriate routing key for an event"""
@@ -161,6 +126,8 @@ def queue_notification(event: NotificationEventModel) -> NotificationResult:
 
         exchange = "notifications"
         routing_key = get_routing_key(event.type)
+
+        from backend.util.clients import get_notification_queue
 
         queue = get_notification_queue()
         queue.publish_message(
@@ -186,6 +153,8 @@ async def queue_notification_async(event: NotificationEventModel) -> Notificatio
 
         exchange = "notifications"
         routing_key = get_routing_key(event.type)
+
+        from backend.util.clients import get_async_notification_queue
 
         queue = await get_async_notification_queue()
         await queue.publish_message(
@@ -242,7 +211,7 @@ class NotificationManager(AppService):
             processed_count = 0
             current_time = datetime.now(tz=timezone.utc)
             start_time = current_time - timedelta(days=7)
-            users = get_db().get_active_user_ids_in_timerange(
+            users = get_database_manager_client().get_active_user_ids_in_timerange(
                 end_time=current_time.isoformat(),
                 start_time=start_time.isoformat(),
             )
@@ -276,14 +245,14 @@ class NotificationManager(AppService):
 
             for notification_type in notification_types:
                 # Get all batches for this notification type
-                batches = get_db().get_all_batches_by_type(notification_type)
+                batches = get_database_manager_client().get_all_batches_by_type(
+                    notification_type
+                )
 
                 for batch in batches:
                     # Check if batch has aged out
-                    oldest_message = (
-                        get_db().get_user_notification_oldest_message_in_batch(
-                            batch.user_id, notification_type
-                        )
+                    oldest_message = get_database_manager_client().get_user_notification_oldest_message_in_batch(
+                        batch.user_id, notification_type
                     )
 
                     if not oldest_message:
@@ -297,7 +266,11 @@ class NotificationManager(AppService):
 
                     # If batch has aged out, process it
                     if oldest_message.created_at + max_delay < current_time:
-                        recipient_email = get_db().get_user_email_by_id(batch.user_id)
+                        recipient_email = (
+                            get_database_manager_client().get_user_email_by_id(
+                                batch.user_id
+                            )
+                        )
 
                         if not recipient_email:
                             logger.error(
@@ -314,13 +287,15 @@ class NotificationManager(AppService):
                                 f"User {batch.user_id} does not want to receive {notification_type} notifications"
                             )
                             # Clear the batch
-                            get_db().empty_user_notification_batch(
+                            get_database_manager_client().empty_user_notification_batch(
                                 batch.user_id, notification_type
                             )
                             continue
 
-                        batch_data = get_db().get_user_notification_batch(
-                            batch.user_id, notification_type
+                        batch_data = (
+                            get_database_manager_client().get_user_notification_batch(
+                                batch.user_id, notification_type
+                            )
                         )
 
                         if not batch_data or not batch_data.notifications:
@@ -328,7 +303,7 @@ class NotificationManager(AppService):
                                 f"Batch data not found for user {batch.user_id}"
                             )
                             # Clear the batch
-                            get_db().empty_user_notification_batch(
+                            get_database_manager_client().empty_user_notification_batch(
                                 batch.user_id, notification_type
                             )
                             continue
@@ -364,7 +339,7 @@ class NotificationManager(AppService):
                         )
 
                         # Clear the batch
-                        get_db().empty_user_notification_batch(
+                        get_database_manager_client().empty_user_notification_batch(
                             batch.user_id, notification_type
                         )
 
@@ -413,9 +388,11 @@ class NotificationManager(AppService):
         self, user_id: str, event_type: NotificationType
     ) -> bool:
         """Check if a user wants to receive a notification based on their preferences and email verification status"""
-        validated_email = get_db().get_user_email_verification(user_id)
+        validated_email = get_database_manager_client().get_user_email_verification(
+            user_id
+        )
         preference = (
-            get_db()
+            get_database_manager_client()
             .get_user_notification_preference(user_id)
             .preferences.get(event_type, True)
         )
@@ -506,10 +483,14 @@ class NotificationManager(AppService):
         self, user_id: str, event_type: NotificationType, event: NotificationEventModel
     ) -> bool:
 
-        get_db().create_or_add_to_user_notification_batch(user_id, event_type, event)
+        get_database_manager_client().create_or_add_to_user_notification_batch(
+            user_id, event_type, event
+        )
 
-        oldest_message = get_db().get_user_notification_oldest_message_in_batch(
-            user_id, event_type
+        oldest_message = (
+            get_database_manager_client().get_user_notification_oldest_message_in_batch(
+                user_id, event_type
+            )
         )
         if not oldest_message:
             logger.error(
@@ -560,7 +541,9 @@ class NotificationManager(AppService):
                 return False
             logger.debug(f"Processing immediate notification: {event}")
 
-            recipient_email = get_db().get_user_email_by_id(event.user_id)
+            recipient_email = get_database_manager_client().get_user_email_by_id(
+                event.user_id
+            )
             if not recipient_email:
                 logger.error(f"User email not found for user {event.user_id}")
                 return False
@@ -595,7 +578,9 @@ class NotificationManager(AppService):
                 return False
             logger.info(f"Processing batch notification: {event}")
 
-            recipient_email = get_db().get_user_email_by_id(event.user_id)
+            recipient_email = get_database_manager_client().get_user_email_by_id(
+                event.user_id
+            )
             if not recipient_email:
                 logger.error(f"User email not found for user {event.user_id}")
                 return False
@@ -614,7 +599,9 @@ class NotificationManager(AppService):
             if not should_send:
                 logger.info("Batch not old enough to send")
                 return False
-            batch = get_db().get_user_notification_batch(event.user_id, event.type)
+            batch = get_database_manager_client().get_user_notification_batch(
+                event.user_id, event.type
+            )
             if not batch or not batch.notifications:
                 logger.error(f"Batch not found for user {event.user_id}")
                 return False
@@ -634,14 +621,95 @@ class NotificationManager(AppService):
                 for db_event in batch.notifications
             ]
 
-            self.email_sender.send_templated(
-                notification=event.type,
-                user_email=recipient_email,
-                data=batch_messages,
-                user_unsub_link=unsub_link,
-            )
-            # only empty the batch if we sent the email successfully
-            get_db().empty_user_notification_batch(event.user_id, event.type)
+            # Split batch into chunks to avoid exceeding email size limits
+            # Start with a reasonable chunk size and adjust dynamically
+            MAX_EMAIL_SIZE = 4_500_000  # 4.5MB to leave buffer under 5MB limit
+            chunk_size = 100  # Initial chunk size
+            successfully_sent_count = 0
+            failed_indices = []
+
+            i = 0
+            while i < len(batch_messages):
+                # Try progressively smaller chunks if needed
+                chunk_sent = False
+                for attempt_size in [chunk_size, 50, 25, 10, 5, 1]:
+                    chunk = batch_messages[i : i + attempt_size]
+
+                    try:
+                        # Try to render the email to check its size
+                        template = self.email_sender._get_template(event.type)
+                        _, test_message = self.email_sender.formatter.format_email(
+                            base_template=template.base_template,
+                            subject_template=template.subject_template,
+                            content_template=template.body_template,
+                            data={"notifications": chunk},
+                            unsubscribe_link=f"{self.email_sender.formatter.env.globals.get('base_url', '')}/profile/settings",
+                        )
+
+                        if len(test_message) < MAX_EMAIL_SIZE:
+                            # Size is acceptable, send the email
+                            logger.info(
+                                f"Sending email with {len(chunk)} notifications "
+                                f"(size: {len(test_message):,} chars)"
+                            )
+
+                            self.email_sender.send_templated(
+                                notification=event.type,
+                                user_email=recipient_email,
+                                data=chunk,
+                                user_unsub_link=unsub_link,
+                            )
+
+                            # Track successful sends
+                            successfully_sent_count += len(chunk)
+
+                            # Update chunk_size for next iteration based on success
+                            if (
+                                attempt_size == chunk_size
+                                and len(test_message) < MAX_EMAIL_SIZE * 0.7
+                            ):
+                                # If we're well under limit, try larger chunks next time
+                                chunk_size = min(chunk_size + 10, 100)
+                            elif len(test_message) > MAX_EMAIL_SIZE * 0.9:
+                                # If we're close to limit, use smaller chunks
+                                chunk_size = max(attempt_size - 10, 1)
+
+                            i += len(chunk)
+                            chunk_sent = True
+                            break
+                    except Exception as e:
+                        if attempt_size == 1:
+                            # Even single notification is too large
+                            logger.error(
+                                f"Single notification too large to send: {e}. "
+                                f"Skipping notification at index {i}"
+                            )
+                            failed_indices.append(i)
+                            i += 1
+                            chunk_sent = True
+                            break
+                        # Try smaller chunk
+                        continue
+
+                if not chunk_sent:
+                    # Should not reach here due to single notification handling
+                    logger.error(f"Failed to send notifications starting at index {i}")
+                    failed_indices.append(i)
+                    i += 1
+
+            # Only empty the batch if ALL notifications were sent successfully
+            if successfully_sent_count == len(batch_messages):
+                logger.info(
+                    f"Successfully sent all {successfully_sent_count} notifications, clearing batch"
+                )
+                get_database_manager_client().empty_user_notification_batch(
+                    event.user_id, event.type
+                )
+            else:
+                logger.warning(
+                    f"Only sent {successfully_sent_count} of {len(batch_messages)} notifications. "
+                    f"Failed indices: {failed_indices}. Batch will be retained for retry."
+                )
             return True
         except Exception as e:
             logger.exception(f"Error processing notification for batch queue: {e}")
@@ -658,7 +726,9 @@ class NotificationManager(AppService):
 
             logger.info(f"Processing summary notification: {model}")
 
-            recipient_email = get_db().get_user_email_by_id(event.user_id)
+            recipient_email = get_database_manager_client().get_user_email_by_id(
+                event.user_id
+            )
             if not recipient_email:
                 logger.error(f"User email not found for user {event.user_id}")
                 return False
@@ -694,36 +764,42 @@ class NotificationManager(AppService):
             logger.exception(f"Error processing notification for summary queue: {e}")
             return False
 
-    async def _run_queue(
+    async def _consume_queue(
         self,
         queue: aio_pika.abc.AbstractQueue,
         process_func: Callable[[str], bool],
-        error_queue_name: str,
+        queue_name: str,
     ):
-        message: aio_pika.abc.AbstractMessage | None = None
-        try:
-            # This parameter "no_ack" is named like shit, think of it as "auto_ack"
-            message = await queue.get(timeout=1.0, no_ack=False)
-            result = process_func(message.body.decode())
-            if result:
-                await message.ack()
-            else:
-                await message.reject(requeue=False)
+        """Continuously consume messages from a queue using async iteration"""
+        logger.info(f"Starting consumer for queue: {queue_name}")
 
-        except QueueEmpty:
-            logger.debug(f"Queue {error_queue_name} empty")
-        except TimeoutError:
-            logger.debug(f"Queue {error_queue_name} timed out")
+        try:
+            async with queue.iterator() as queue_iter:
+                async for message in queue_iter:
+                    if not self.running:
+                        break
+
+                    try:
+                        async with message.process():
+                            result = process_func(message.body.decode())
+                            if not result:
+                                # Message will be rejected when exiting context without exception
+                                raise aio_pika.exceptions.MessageProcessError(
+                                    "Processing failed"
+                                )
+                    except aio_pika.exceptions.MessageProcessError:
+                        # Let message.process() handle the rejection
+                        pass
+                    except Exception as e:
+                        logger.error(f"Error processing message in {queue_name}: {e}")
+                        # Let message.process() handle the rejection
+                        raise
+        except asyncio.CancelledError:
+            logger.info(f"Consumer for {queue_name} cancelled")
+            raise
         except Exception as e:
-            if message:
-                logger.error(
-                    f"Error in notification service loop, message rejected {e}"
-                )
-                await message.reject(requeue=False)
-            else:
-                logger.exception(
-                    f"Error in notification service loop, message unable to be rejected, and will have to be manually removed to free space in the queue: {e=}"
-                )
+            logger.exception(f"Fatal error in consumer for {queue_name}: {e}")
+            raise
 
     @continuous_retry()
     def run_service(self):
@@ -736,41 +812,60 @@ class NotificationManager(AppService):
 
         logger.info(f"[{self.service_name}] Started notification service")
 
-        # Set up queue consumers
+        # Set up queue consumers with QoS settings
         channel = await self.rabbit.get_channel()
+
+        # Set prefetch to prevent overwhelming the service
+        await channel.set_qos(prefetch_count=10)
 
         immediate_queue = await channel.get_queue("immediate_notifications")
         batch_queue = await channel.get_queue("batch_notifications")
-
         admin_queue = await channel.get_queue("admin_notifications")
-
         summary_queue = await channel.get_queue("summary_notifications")
 
-        while self.running:
-            try:
-                await self._run_queue(
+        # Create consumer tasks for each queue - running in parallel
+        consumer_tasks = [
+            asyncio.create_task(
+                self._consume_queue(
                     queue=immediate_queue,
                     process_func=self._process_immediate,
-                    error_queue_name="immediate_notifications",
+                    queue_name="immediate_notifications",
                 )
-                await self._run_queue(
+            ),
+            asyncio.create_task(
+                self._consume_queue(
                     queue=admin_queue,
                     process_func=self._process_admin_message,
-                    error_queue_name="admin_notifications",
+                    queue_name="admin_notifications",
                 )
-                await self._run_queue(
+            ),
+            asyncio.create_task(
+                self._consume_queue(
                     queue=batch_queue,
                     process_func=self._process_batch,
-                    error_queue_name="batch_notifications",
+                    queue_name="batch_notifications",
                 )
-                await self._run_queue(
+            ),
+            asyncio.create_task(
+                self._consume_queue(
                     queue=summary_queue,
                     process_func=self._process_summary,
-                    error_queue_name="summary_notifications",
+                    queue_name="summary_notifications",
                 )
-                await asyncio.sleep(0.1)
-            except QueueEmpty as e:
-                logger.debug(f"Queue empty: {e}")
+            ),
+        ]
+
+        try:
+            # Run all consumers concurrently
+            await asyncio.gather(*consumer_tasks)
+        except asyncio.CancelledError:
+            logger.info("Service shutdown requested")
+            # Cancel all consumer tasks
+            for task in consumer_tasks:
+                task.cancel()
+            # Wait for all tasks to complete cancellation
+            await asyncio.gather(*consumer_tasks, return_exceptions=True)
+            raise
 
     def cleanup(self):
         """Cleanup service resources"""
