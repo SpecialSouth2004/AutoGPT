@@ -1,8 +1,10 @@
 import asyncio
 import base64
 import logging
+import time
+import uuid
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Any, Sequence
 
 import pydantic
@@ -27,20 +29,9 @@ from typing_extensions import Optional, TypedDict
 import backend.server.integrations.router
 import backend.server.routers.analytics
 import backend.server.v2.library.db as library_db
+from backend.data import api_key as api_key_db
 from backend.data import execution as execution_db
 from backend.data import graph as graph_db
-from backend.data.api_key import (
-    APIKeyError,
-    APIKeyNotFoundError,
-    APIKeyPermissionError,
-    APIKeyWithoutHash,
-    generate_api_key,
-    get_api_key_by_id,
-    list_user_api_keys,
-    revoke_api_key,
-    suspend_api_key,
-    update_api_key_permissions,
-)
 from backend.data.block import BlockInput, CompletedBlockOutput, get_block, get_blocks
 from backend.data.credit import (
     AutoTopUpConfig,
@@ -74,6 +65,11 @@ from backend.integrations.webhooks.graph_lifecycle_hooks import (
     on_graph_activate,
     on_graph_deactivate,
 )
+from backend.monitoring.instrumentation import (
+    record_block_execution,
+    record_graph_execution,
+    record_graph_operation,
+)
 from backend.server.model import (
     CreateAPIKeyRequest,
     CreateAPIKeyResponse,
@@ -106,6 +102,7 @@ def _create_file_size_error(size_bytes: int, max_size_mb: int) -> HTTPException:
 
 settings = Settings()
 logger = logging.getLogger(__name__)
+
 
 _user_credit_model = get_user_credit_model()
 
@@ -175,7 +172,6 @@ async def get_user_timezone_route(
     summary="Update user timezone",
     tags=["auth"],
     dependencies=[Security(requires_user)],
-    response_model=TimezoneResponse,
 )
 async def update_user_timezone_route(
     user_id: Annotated[str, Security(get_user_id)], request: UpdateTimezoneRequest
@@ -291,10 +287,26 @@ async def execute_graph_block(block_id: str, data: BlockInput) -> CompletedBlock
     if not obj:
         raise HTTPException(status_code=404, detail=f"Block #{block_id} not found.")
 
-    output = defaultdict(list)
-    async for name, data in obj.execute(data):
-        output[name].append(data)
-    return output
+    start_time = time.time()
+    try:
+        output = defaultdict(list)
+        async for name, data in obj.execute(data):
+            output[name].append(data)
+
+        # Record successful block execution with duration
+        duration = time.time() - start_time
+        block_type = obj.__class__.__name__
+        record_block_execution(
+            block_type=block_type, status="success", duration=duration
+        )
+
+        return output
+    except Exception:
+        # Record failed block execution
+        duration = time.time() - start_time
+        block_type = obj.__class__.__name__
+        record_block_execution(block_type=block_type, status="error", duration=duration)
+        raise
 
 
 @v1_router.post(
@@ -790,7 +802,7 @@ async def execute_graph(
         )
 
     try:
-        return await execution_utils.add_graph_execution(
+        result = await execution_utils.add_graph_execution(
             graph_id=graph_id,
             user_id=user_id,
             inputs=inputs,
@@ -798,7 +810,16 @@ async def execute_graph(
             graph_version=graph_version,
             graph_credentials_inputs=credentials_inputs,
         )
+        # Record successful graph execution
+        record_graph_execution(graph_id=graph_id, status="success", user_id=user_id)
+        record_graph_operation(operation="execute", status="success")
+        return result
     except GraphValidationError as e:
+        # Record failed graph execution
+        record_graph_execution(
+            graph_id=graph_id, status="validation_error", user_id=user_id
+        )
+        record_graph_operation(operation="execute", status="validation_error")
         # Return structured validation errors that the frontend can parse
         raise HTTPException(
             status_code=400,
@@ -809,6 +830,11 @@ async def execute_graph(
                 "node_errors": e.node_errors,
             },
         )
+    except Exception:
+        # Record any other failures
+        record_graph_execution(graph_id=graph_id, status="error", user_id=user_id)
+        record_graph_operation(operation="execute", status="error")
+        raise
 
 
 @v1_router.post(
@@ -933,6 +959,99 @@ async def delete_graph_execution(
     )
 
 
+class ShareRequest(pydantic.BaseModel):
+    """Optional request body for share endpoint."""
+
+    pass  # Empty body is fine
+
+
+class ShareResponse(pydantic.BaseModel):
+    """Response from share endpoints."""
+
+    share_url: str
+    share_token: str
+
+
+@v1_router.post(
+    "/graphs/{graph_id}/executions/{graph_exec_id}/share",
+    dependencies=[Security(requires_user)],
+)
+async def enable_execution_sharing(
+    graph_id: Annotated[str, Path],
+    graph_exec_id: Annotated[str, Path],
+    user_id: Annotated[str, Security(get_user_id)],
+    _body: ShareRequest = Body(default=ShareRequest()),
+) -> ShareResponse:
+    """Enable sharing for a graph execution."""
+    # Verify the execution belongs to the user
+    execution = await execution_db.get_graph_execution(
+        user_id=user_id, execution_id=graph_exec_id
+    )
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+
+    # Generate a unique share token
+    share_token = str(uuid.uuid4())
+
+    # Update the execution with share info
+    await execution_db.update_graph_execution_share_status(
+        execution_id=graph_exec_id,
+        user_id=user_id,
+        is_shared=True,
+        share_token=share_token,
+        shared_at=datetime.now(timezone.utc),
+    )
+
+    # Return the share URL
+    frontend_url = Settings().config.frontend_base_url or "http://localhost:3000"
+    share_url = f"{frontend_url}/share/{share_token}"
+
+    return ShareResponse(share_url=share_url, share_token=share_token)
+
+
+@v1_router.delete(
+    "/graphs/{graph_id}/executions/{graph_exec_id}/share",
+    status_code=HTTP_204_NO_CONTENT,
+    dependencies=[Security(requires_user)],
+)
+async def disable_execution_sharing(
+    graph_id: Annotated[str, Path],
+    graph_exec_id: Annotated[str, Path],
+    user_id: Annotated[str, Security(get_user_id)],
+) -> None:
+    """Disable sharing for a graph execution."""
+    # Verify the execution belongs to the user
+    execution = await execution_db.get_graph_execution(
+        user_id=user_id, execution_id=graph_exec_id
+    )
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+
+    # Remove share info
+    await execution_db.update_graph_execution_share_status(
+        execution_id=graph_exec_id,
+        user_id=user_id,
+        is_shared=False,
+        share_token=None,
+        shared_at=None,
+    )
+
+
+@v1_router.get("/public/shared/{share_token}")
+async def get_shared_execution(
+    share_token: Annotated[
+        str,
+        Path(regex=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"),
+    ],
+) -> execution_db.SharedExecutionResponse:
+    """Get a shared graph execution by share token (no auth required)."""
+    execution = await execution_db.get_graph_execution_by_share_token(share_token)
+    if not execution:
+        raise HTTPException(status_code=404, detail="Shared execution not found")
+
+    return execution
+
+
 ########################################################
 ##################### Schedules ########################
 ########################################################
@@ -1055,7 +1174,6 @@ async def delete_graph_execution_schedule(
 @v1_router.post(
     "/api-keys",
     summary="Create new API key",
-    response_model=CreateAPIKeyResponse,
     tags=["api-keys"],
     dependencies=[Security(requires_user)],
 )
@@ -1063,128 +1181,73 @@ async def create_api_key(
     request: CreateAPIKeyRequest, user_id: Annotated[str, Security(get_user_id)]
 ) -> CreateAPIKeyResponse:
     """Create a new API key"""
-    try:
-        api_key, plain_text = await generate_api_key(
-            name=request.name,
-            user_id=user_id,
-            permissions=request.permissions,
-            description=request.description,
-        )
-        return CreateAPIKeyResponse(api_key=api_key, plain_text_key=plain_text)
-    except APIKeyError as e:
-        logger.error(
-            "Could not create API key for user %s: %s. Review input and permissions.",
-            user_id,
-            e,
-        )
-        raise HTTPException(
-            status_code=400,
-            detail={"message": str(e), "hint": "Verify request payload and try again."},
-        )
+    api_key_info, plain_text_key = await api_key_db.create_api_key(
+        name=request.name,
+        user_id=user_id,
+        permissions=request.permissions,
+        description=request.description,
+    )
+    return CreateAPIKeyResponse(api_key=api_key_info, plain_text_key=plain_text_key)
 
 
 @v1_router.get(
     "/api-keys",
     summary="List user API keys",
-    response_model=list[APIKeyWithoutHash] | dict[str, str],
     tags=["api-keys"],
     dependencies=[Security(requires_user)],
 )
 async def get_api_keys(
     user_id: Annotated[str, Security(get_user_id)],
-) -> list[APIKeyWithoutHash]:
+) -> list[api_key_db.APIKeyInfo]:
     """List all API keys for the user"""
-    try:
-        return await list_user_api_keys(user_id)
-    except APIKeyError as e:
-        logger.error("Failed to list API keys for user %s: %s", user_id, e)
-        raise HTTPException(
-            status_code=400,
-            detail={"message": str(e), "hint": "Check API key service availability."},
-        )
+    return await api_key_db.list_user_api_keys(user_id)
 
 
 @v1_router.get(
     "/api-keys/{key_id}",
     summary="Get specific API key",
-    response_model=APIKeyWithoutHash,
     tags=["api-keys"],
     dependencies=[Security(requires_user)],
 )
 async def get_api_key(
     key_id: str, user_id: Annotated[str, Security(get_user_id)]
-) -> APIKeyWithoutHash:
+) -> api_key_db.APIKeyInfo:
     """Get a specific API key"""
-    try:
-        api_key = await get_api_key_by_id(key_id, user_id)
-        if not api_key:
-            raise HTTPException(status_code=404, detail="API key not found")
-        return api_key
-    except APIKeyError as e:
-        logger.error("Error retrieving API key %s for user %s: %s", key_id, user_id, e)
-        raise HTTPException(
-            status_code=400,
-            detail={"message": str(e), "hint": "Ensure the key ID is correct."},
-        )
+    api_key = await api_key_db.get_api_key_by_id(key_id, user_id)
+    if not api_key:
+        raise HTTPException(status_code=404, detail="API key not found")
+    return api_key
 
 
 @v1_router.delete(
     "/api-keys/{key_id}",
     summary="Revoke API key",
-    response_model=APIKeyWithoutHash,
     tags=["api-keys"],
     dependencies=[Security(requires_user)],
 )
 async def delete_api_key(
     key_id: str, user_id: Annotated[str, Security(get_user_id)]
-) -> Optional[APIKeyWithoutHash]:
+) -> api_key_db.APIKeyInfo:
     """Revoke an API key"""
-    try:
-        return await revoke_api_key(key_id, user_id)
-    except APIKeyNotFoundError:
-        raise HTTPException(status_code=404, detail="API key not found")
-    except APIKeyPermissionError:
-        raise HTTPException(status_code=403, detail="Permission denied")
-    except APIKeyError as e:
-        logger.error("Failed to revoke API key %s for user %s: %s", key_id, user_id, e)
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": str(e),
-                "hint": "Verify permissions or try again later.",
-            },
-        )
+    return await api_key_db.revoke_api_key(key_id, user_id)
 
 
 @v1_router.post(
     "/api-keys/{key_id}/suspend",
     summary="Suspend API key",
-    response_model=APIKeyWithoutHash,
     tags=["api-keys"],
     dependencies=[Security(requires_user)],
 )
 async def suspend_key(
     key_id: str, user_id: Annotated[str, Security(get_user_id)]
-) -> Optional[APIKeyWithoutHash]:
+) -> api_key_db.APIKeyInfo:
     """Suspend an API key"""
-    try:
-        return await suspend_api_key(key_id, user_id)
-    except APIKeyNotFoundError:
-        raise HTTPException(status_code=404, detail="API key not found")
-    except APIKeyPermissionError:
-        raise HTTPException(status_code=403, detail="Permission denied")
-    except APIKeyError as e:
-        logger.error("Failed to suspend API key %s for user %s: %s", key_id, user_id, e)
-        raise HTTPException(
-            status_code=400,
-            detail={"message": str(e), "hint": "Check user permissions and retry."},
-        )
+    return await api_key_db.suspend_api_key(key_id, user_id)
 
 
 @v1_router.put(
     "/api-keys/{key_id}/permissions",
     summary="Update key permissions",
-    response_model=APIKeyWithoutHash,
     tags=["api-keys"],
     dependencies=[Security(requires_user)],
 )
@@ -1192,22 +1255,8 @@ async def update_permissions(
     key_id: str,
     request: UpdatePermissionsRequest,
     user_id: Annotated[str, Security(get_user_id)],
-) -> Optional[APIKeyWithoutHash]:
+) -> api_key_db.APIKeyInfo:
     """Update API key permissions"""
-    try:
-        return await update_api_key_permissions(key_id, user_id, request.permissions)
-    except APIKeyNotFoundError:
-        raise HTTPException(status_code=404, detail="API key not found")
-    except APIKeyPermissionError:
-        raise HTTPException(status_code=403, detail="Permission denied")
-    except APIKeyError as e:
-        logger.error(
-            "Failed to update permissions for API key %s of user %s: %s",
-            key_id,
-            user_id,
-            e,
-        )
-        raise HTTPException(
-            status_code=400,
-            detail={"message": str(e), "hint": "Ensure permissions list is valid."},
-        )
+    return await api_key_db.update_api_key_permissions(
+        key_id, user_id, request.permissions
+    )
