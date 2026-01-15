@@ -66,6 +66,7 @@ export const RunInputDialog = ({
                     formContext={{
                       showHandles: false,
                       size: "large",
+                      showOptionalToggle: false,
                     }}
                   />
                 </div>
@@ -80,18 +81,16 @@ export const RunInputDialog = ({
                     Inputs
                   </Text>
                 </div>
-                <div className="px-2">
-                  <FormRenderer
-                    jsonSchema={inputSchema as RJSFSchema}
-                    handleChange={(v) => handleInputChange(v.formData)}
-                    uiSchema={uiSchema}
-                    initialValues={{}}
-                    formContext={{
-                      showHandles: false,
-                      size: "large",
-                    }}
-                  />
-                </div>
+                <FormRenderer
+                  jsonSchema={inputSchema as RJSFSchema}
+                  handleChange={(v) => handleInputChange(v.formData)}
+                  uiSchema={uiSchema}
+                  initialValues={{}}
+                  formContext={{
+                    showHandles: false,
+                    size: "large",
+                  }}
+                />
               </div>
             )}
 
