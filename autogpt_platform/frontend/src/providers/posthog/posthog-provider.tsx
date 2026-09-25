@@ -8,6 +8,8 @@ import {
 } from "@/services/analytics/anonymous-id";
 import { useConsent } from "@/services/consent/useConsent";
 import { environment } from "@/services/environment";
+import { usesPostHog } from "@/services/feature-flags/flag-backend";
+import { buildFlagPersonProperties } from "@/services/feature-flags/helpers";
 import { PostHogProvider as PHProvider } from "@posthog/react";
 import { usePathname, useSearchParams } from "next/navigation";
 import posthog from "posthog-js";
@@ -74,6 +76,11 @@ export function PostHogUserTracker() {
 
     if (user) {
       if (previousUserIdRef.current !== user.id) {
+        // Flag-only properties ride on /flags and are never stored on the
+        // person profile, so identify stays exactly what analytics sends.
+        if (usesPostHog()) {
+          posthog.setPersonPropertiesForFlags(buildFlagPersonProperties(user));
+        }
         posthog.identify(user.id, {
           email: user.email,
           ...(user.user_metadata?.name && { name: user.user_metadata.name }),
