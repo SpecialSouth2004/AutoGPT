@@ -105,7 +105,7 @@ class Flag(str, Enum):
     # No "enabled-users list" flag — LD's per-flag targeting natively
     # cohorts the canary (internal team → 5 → 50 → 500 → 5k), and
     # ``is_feature_enabled(..., user_id, ...)`` evaluates each user.
-    # The four flags below are the master gate + three per-feature
+    # The flags below are the master gate + its per-feature
     # gates. Helper functions live next to the code that consumes them
     # (added when each feature lands); these enum entries are
     # scaffolding so the LD keys can be configured ahead of code.
@@ -135,23 +135,6 @@ class Flag(str, Enum):
     # browse and install end-to-end: the routes 404 when off, so the dark
     # launch is not reachable by URL with the shelf hidden. Fail-closed.
     SKILLS_HUB = "skills-hub"
-
-    # Per-feature gate for the web-fact-check tool (P0.5). The tool
-    # can only DEMOTE memories on contradiction; new web-derived
-    # facts ride the ratification loop as tentative. Off on the
-    # local-LLM transport by default (most local installs lack a
-    # search-API key); cloud opt-in. Independent of
-    # ``DREAM_PASS_ENABLED`` so the dream pass can run without
-    # external network calls when this flag is off.
-    DREAM_PASS_WEB_FACT_CHECK = "dream-pass-web-fact-check"
-
-    # Orchestrator-level kill switch for the web-fact-check hook
-    # introduced alongside the P0.5 scaffolding. Distinct from
-    # ``DREAM_PASS_WEB_FACT_CHECK`` so the hook can be wired into the
-    # orchestrator without auto-running on every dream pass before a
-    # search backend is bound — flip this on per-user once a backend
-    # is configured.
-    DREAM_WEB_FACT_CHECK_ENABLED = "dream-web-fact-check-enabled"
 
     # Per-feature gate for the cascading-expiry helper
     # ``invalidate_entity_direct_neighbors`` (P0.3b). When on, the
@@ -255,7 +238,10 @@ def _stop_shadow_evaluations() -> None:
     global _shadow_evaluations_stopped
     _shadow_evaluations_stopped = True
     for task in list(_shadow_evaluations):
-        task.cancel()
+        # A service's cleanup can close the task's loop first, and cancelling
+        # a task on a closed loop raises.
+        if not task.get_loop().is_closed():
+            task.cancel()
     _shadow_evaluations.clear()
 
 
@@ -315,9 +301,8 @@ def shutdown_launchdarkly() -> None:
     if not _is_initialized:
         # `initialize_launchdarkly` returns early when no SDK key is configured,
         # so `ldclient.set_config` was never called and `ldclient.get()` would
-        # raise "set_config was not called". Callers pair init/shutdown on
-        # app_env alone (see `rest_api.feature_flag_context` and
-        # `scheduler._shutdown_feature_flags_for_scheduler`), so an unconfigured
+        # raise "set_config was not called". `AppProcess.execute_run_command`
+        # pairs init/shutdown on app_env alone, so an unconfigured
         # non-LOCAL deployment would otherwise raise out of service teardown and
         # leave the process alive instead of exiting.
         return

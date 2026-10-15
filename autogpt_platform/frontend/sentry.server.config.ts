@@ -8,14 +8,14 @@ import { environment } from "@/services/environment";
 import * as Sentry from "@sentry/nextjs";
 // import { NodeProfilingIntegration } from "@sentry/profiling-node";
 
-const shouldEnable = environment.isSentryEnabled();
+const dsn = environment.getSentryDSN();
 
 Sentry.init({
-  dsn: "https://fe4e4aa4a283391808a5da396da20159@o4505260022104064.ingest.us.sentry.io/4507946746380288",
+  dsn,
 
-  environment: environment.getEnvironmentStr(),
+  environment: environment.getSentryEnvironment(),
 
-  enabled: shouldEnable,
+  enabled: Boolean(dsn),
 
   // Define how likely traces are sampled. Adjust this value in production, or use tracesSampler for greater control.
   tracesSampleRate: 1,
@@ -39,7 +39,10 @@ Sentry.init({
   // Integrations
   integrations: [
     Sentry.requestDataIntegration({ include: { cookies: false, data: false } }),
-    Sentry.anrIntegration(),
+    // Vercel freezes an idle function between requests, and the ANR watchdog
+    // reports every thaw as a blocked event loop with no stack (BUILDER-9).
+    // Only a long-lived self-hosted Node server can really hang.
+    ...(environment.isVercel() ? [] : [Sentry.anrIntegration()]),
     // NodeProfilingIntegration,
     Sentry.extraErrorDataIntegration(),
     // Sentry.fsIntegration(),

@@ -20,8 +20,7 @@ const DSN =
 
 beforeEach(() => {
   authMiddlewareMock.mockReset();
-  vi.stubEnv("NEXT_PUBLIC_BEHAVE_AS", "CLOUD");
-  vi.stubEnv("NEXT_PUBLIC_APP_ENV", "dev");
+  vi.stubEnv("NEXT_PUBLIC_SENTRY_DSN", DSN);
 });
 
 afterEach(() => {
@@ -44,12 +43,20 @@ describe("Sentry tunnel", () => {
     ).toBe(true);
   });
 
-  it("forwards our envelopes to our ingest", async () => {
-    const response = await middleware(envelopePost(getSentryTunnelURL(DSN)));
-
-    expect(response.headers.get("x-middleware-rewrite")).toBe(
+  it.each([
+    [
+      DSN,
       "https://o4505260022104064.ingest.us.sentry.io/api/4507946746380288/envelope/?hsts=0",
-    );
+    ],
+    [
+      "https://key@o1.ingest.sentry.io/2",
+      "https://o1.ingest.sentry.io/api/2/envelope/?hsts=0",
+    ],
+  ])("forwards %s's envelopes to its ingest", async (dsn, destination) => {
+    vi.stubEnv("NEXT_PUBLIC_SENTRY_DSN", dsn);
+    const response = await middleware(envelopePost(getSentryTunnelURL(dsn)));
+
+    expect(response.headers.get("x-middleware-rewrite")).toBe(destination);
     expect(authMiddlewareMock).not.toHaveBeenCalled();
   });
 
@@ -81,8 +88,8 @@ describe("Sentry tunnel", () => {
     expect(authMiddlewareMock).not.toHaveBeenCalled();
   });
 
-  it("relays nothing while Sentry is disabled", async () => {
-    vi.stubEnv("NEXT_PUBLIC_BEHAVE_AS", "LOCAL");
+  it("relays nothing without a configured DSN", async () => {
+    vi.stubEnv("NEXT_PUBLIC_SENTRY_DSN", "");
     const response = await middleware(envelopePost(getSentryTunnelURL(DSN)));
 
     expect(response.status).toBe(404);
