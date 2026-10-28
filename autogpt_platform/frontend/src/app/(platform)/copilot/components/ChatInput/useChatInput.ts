@@ -1,6 +1,7 @@
 import { useCopilotUIStore } from "@/app/(platform)/copilot/store";
 import { isTouchDevice } from "@/lib/platform";
 import { toastSendFailure } from "../../helpers/sendFailureToast";
+import { isFocusInOtherOverlay } from "./helpers";
 import { useChatDraft } from "./useChatDraft";
 import { ChangeEvent, FormEvent, useEffect, useRef, useState } from "react";
 
@@ -18,6 +19,7 @@ interface Args {
   canSendEmpty?: boolean;
   inputId?: string;
   draftKey?: string;
+  autoFocus?: boolean;
   /** Names what failed in the toast, e.g. a scheduled send. */
   failureTitle?: string | ((error: unknown) => string);
 }
@@ -31,6 +33,7 @@ export function useChatInput({
   canSendEmpty = false,
   inputId = "chat-input",
   draftKey,
+  autoFocus = true,
   failureTitle = "Couldn't send message",
 }: Args) {
   const [value, setValue] = useChatDraft(draftKey);
@@ -74,18 +77,18 @@ export function useChatInput({
   // composer waits for a tap there.
   useEffect(
     function focusOnMount() {
-      if (isTouchDevice()) return;
-      document.getElementById(inputId)?.focus();
+      if (!autoFocus || isTouchDevice()) return;
+      takeFocus(inputId);
     },
-    [inputId],
+    [autoFocus, inputId],
   );
 
   useEffect(
     function focusWhenEnabled() {
-      if (disabled || isTouchDevice()) return;
-      document.getElementById(inputId)?.focus();
+      if (!autoFocus || disabled || isTouchDevice()) return;
+      takeFocus(inputId);
     },
-    [disabled, inputId],
+    [autoFocus, disabled, inputId],
   );
 
   async function handleSend(message = value) {
@@ -100,23 +103,26 @@ export function useChatInput({
     // turn. On failure the draft is restored (see restoreFailedDraft).
     setValue("");
     dismissKeyboard();
-    try {
+    async function sendAndNotify() {
       await onSend(trimmedMessage);
       notifyMessageSent();
-    } catch (error) {
-      setValue((current) => restoreFailedDraft(current, message));
-      toastSendFailure({
-        title:
-          typeof failureTitle === "function"
-            ? failureTitle(error)
-            : failureTitle,
-        error,
-        recovery: "your message is back in the composer",
-      });
-    } finally {
-      isSubmittingRef.current = false;
-      setIsSending(false);
     }
+    await sendAndNotify()
+      .catch((error) => {
+        setValue((current) => restoreFailedDraft(current, message));
+        toastSendFailure({
+          title:
+            typeof failureTitle === "function"
+              ? failureTitle(error)
+              : failureTitle,
+          error,
+          recovery: "your message is back in the composer",
+        });
+      })
+      .finally(() => {
+        isSubmittingRef.current = false;
+        setIsSending(false);
+      });
   }
 
   // Deliberately not behind `isSubmittingRef`: in an existing chat `onSend`
@@ -132,19 +138,22 @@ export function useChatInput({
     setIsEnqueueing(true);
     setValue("");
     dismissKeyboard();
-    try {
-      await onEnqueue(trimmedMessage);
-    } catch (error) {
-      setValue((current) => restoreFailedDraft(current, message));
-      toastSendFailure({
-        title: "Couldn't send message",
-        error,
-        recovery: "your message is back in the composer",
-      });
-    } finally {
-      isEnqueueingRef.current = false;
-      setIsEnqueueing(false);
+    async function enqueue(send: NonNullable<Args["onEnqueue"]>) {
+      await send(trimmedMessage);
     }
+    await enqueue(onEnqueue)
+      .catch((error) => {
+        setValue((current) => restoreFailedDraft(current, message));
+        toastSendFailure({
+          title: "Couldn't send message",
+          error,
+          recovery: "your message is back in the composer",
+        });
+      })
+      .finally(() => {
+        isEnqueueingRef.current = false;
+        setIsEnqueueing(false);
+      });
   }
 
   // A phone keyboard covers the reply that is about to stream in.
@@ -189,4 +198,10 @@ export function useChatInput({
 function restoreFailedDraft(current: string, failed: string) {
   if (!current.trim() || current === failed) return failed;
   return `${failed}\n\n${current}`;
+}
+
+function takeFocus(inputId: string) {
+  const input = document.getElementById(inputId);
+  if (isFocusInOtherOverlay(input)) return;
+  input?.focus();
 }
