@@ -22,6 +22,7 @@ limits.  Requires bubblewrap to be installed (Linux only).
 """
 
 import asyncio
+import contextlib
 import logging
 import shlex
 from typing import Any
@@ -33,6 +34,7 @@ from pydantic import BaseModel
 from backend.copilot.constants import HUNG_TOOL_CAP_SECONDS
 from backend.copilot.context import (
     E2B_WORKDIR,
+    get_bash_command_as_written,
     get_current_permissions,
     get_current_sandbox,
     looks_like_sdk_tool_result_path,
@@ -66,7 +68,7 @@ from .base import BaseTool
 from .connect_integration import requested_scopes
 from .e2b_sandbox import SandboxOwner, keep_sandbox_running
 from .models import BashExecResponse, ErrorResponse, ToolResponseBase
-from .sandbox import get_workspace_dir, has_full_sandbox, run_sandboxed
+from .sandbox import MAX_OUTPUT_SIZE, get_workspace_dir, has_full_sandbox, run_sandboxed
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +133,9 @@ class _E2BRun(BaseModel):
     elapsed: float
     exit_code: int | None = None
     timed_out: bool = False
-    # Kill sent after a timeout: True done, False not found, None unknown.
+    # It printed more than MAX_OUTPUT_SIZE on one stream; the rest is not kept.
+    output_exceeded: bool = False
+    # Kill sent after either: True done, False not found, None unknown.
     killed: bool | None = None
     # The processes the command started were killed along with it.
     children_killed: bool = False
@@ -177,6 +181,7 @@ class BashExecTool(BaseTool):
     """Execute Bash commands on E2B or in a bubblewrap sandbox."""
 
     has_gate_subject = True
+    writes_files = True
 
     @property
     def name(self) -> str:
@@ -188,10 +193,11 @@ class BashExecTool(BaseTool):
             "Execute a Bash command or script. Shares filesystem with SDK file tools. "
             "Useful for scripts, data processing, and package installation. "
             "Killed after `timeout` seconds. Anything that should persist belongs "
-            "in ~/workspace (a durable volume); other paths are scratch. The "
+            "in ~/workspace (a durable folder; the user's uploads are not in it, "
+            "see list_workspace_files); other paths are scratch. The "
             "desktop (start_desktop) is this same machine, all paths included. "
             "Expert sessions: ~/workspace is the expert's own machine, ~/shared "
-            "is the user's workspace."
+            "is the user's folder."
         )
 
     @property
@@ -285,9 +291,16 @@ class BashExecTool(BaseTool):
         # Pre-flight redirect: bash sandbox can't reach host-side SDK
         # tool-result paths. Without this the model burns turns retrying
         # `cat /root/.claude/projects/...` after `Permission denied`.
-        if looks_like_sdk_tool_result_path(command):
+        # Checks the command as written, minus its ``@@agptfile:`` refs, so
+        # neither a ref nor the file content it expands to trips the check.
+        # A command that is only refs is unset, and its expanded script is
+        # checked instead.
+        as_written = get_bash_command_as_written()
+        if as_written is None:
+            as_written = command
+        if looks_like_sdk_tool_result_path(as_written):
             return ErrorResponse(
-                message=sdk_tool_result_redirect_hint(command),
+                message=sdk_tool_result_redirect_hint(as_written),
                 error="sdk_tool_result_path_in_bash_command",
                 session_id=session_id,
             ).from_outside()
@@ -463,8 +476,8 @@ async def _follow_command(
     replayed by E2B.  Raises only when the command could not be started.
     """
     loop = asyncio.get_running_loop()
-    stdout: list[str] = []
-    stderr: list[str] = []
+    stdout = _CappedOutput()
+    stderr = _CappedOutput()
     started = loop.time()
     deadline = started + timeout
     handle = await sandbox.commands.run(
@@ -481,8 +494,8 @@ async def _follow_command(
 
     def outcome(**kwargs: Any) -> _E2BRun:
         return _E2BRun(
-            stdout="".join(stdout),
-            stderr="".join(stderr),
+            stdout="".join(stdout.chunks),
+            stderr="".join(stderr.chunks),
             elapsed=loop.time() - started,
             reconnects=reconnects,
             **kwargs,
@@ -495,6 +508,12 @@ async def _follow_command(
         except CommandExitException as exc:
             return outcome(exit_code=exc.exit_code)
         except Exception as exc:
+            if stdout.exceeded or stderr.exceeded:
+                # The handle keeps its own copy of every chunk while followed;
+                # the kill still runs if detaching fails.
+                with contextlib.suppress(Exception):
+                    await handle.disconnect()
+                return outcome(output_exceeded=True, **await _kill(sandbox, pid))
             remaining = deadline - loop.time()
             if remaining <= _DEADLINE_SLACK_SECONDS:
                 return outcome(timed_out=True, **await _kill(sandbox, pid))
@@ -531,6 +550,28 @@ async def _follow_command(
                 return outcome(lost=type(exc).__name__)
 
 
+class _OutputExceeded(Exception):
+    """A command printed more than ``MAX_OUTPUT_SIZE`` on one stream."""
+
+
+class _CappedOutput:
+    """One output stream of a command, kept up to ``MAX_OUTPUT_SIZE``."""
+
+    def __init__(self) -> None:
+        self.chunks: list[str] = []
+        self.exceeded = False
+        self._room = MAX_OUTPUT_SIZE
+
+    def append(self, chunk: str) -> None:
+        # Raising stops the SDK reading the stream, and handle.wait() re-raises it.
+        kept = chunk[: self._room]
+        self.chunks.append(kept)
+        self._room -= len(kept)
+        if len(kept) < len(chunk):
+            self.exceeded = True
+            raise _OutputExceeded
+
+
 async def _kill(sandbox: AsyncSandbox, pid: int) -> dict[str, Any]:
     children_killed = await _kill_children(sandbox, pid)
     try:
@@ -538,7 +579,7 @@ async def _kill(sandbox: AsyncSandbox, pid: int) -> dict[str, Any]:
             sandbox.commands.kill(pid), timeout=_KILL_TIMEOUT_SECONDS
         )
     except Exception as exc:
-        logger.warning("[E2B] Could not kill timed-out pid %s: %s", pid, exc)
+        logger.warning(f"[E2B] Could not kill pid {pid}: {exc}")
         killed = None
     return {"killed": killed, "children_killed": children_killed}
 
@@ -572,7 +613,7 @@ def _run_response(
         return response
 
     elapsed = f"{run.elapsed:.1f}s"
-    if run.timed_out:
+    if run.timed_out or run.output_exceeded:
         if run.killed is True and run.children_killed:
             fate = "it was killed, with every process it started."
         elif run.killed is True:
@@ -584,7 +625,13 @@ def _run_response(
             fate = "it had already ended."
         else:
             fate = "it could not be killed and may still be running."
-        note = f"Timed out after {timeout}s"
+        if run.timed_out:
+            note = f"Timed out after {timeout}s"
+        else:
+            note = (
+                f"Printed more than {MAX_OUTPUT_SIZE:,} characters; redirect "
+                "output to a file and read parts of it"
+            )
         message = f"{note}; {fate}"
     elif run.ended_unseen:
         note = (

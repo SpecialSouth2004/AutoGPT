@@ -38,6 +38,7 @@ from backend.data.model import User as AppUser
 from backend.data.model import UserCreditTransactionAdminView
 from backend.data.notifications import NotificationEventModel, OpsData
 from backend.data.posthog_lifecycle_sync import schedule_posthog_lifecycle_sync
+from backend.data.stripe_authentication import requires_authentication
 from backend.data.stripe_client import stripe_call, stripe_list_items
 from backend.data.subscription_checkout import (
     ensure_no_unconverted_trial,
@@ -472,7 +473,10 @@ class UserCreditBase(ABC):
             # Transaction doesn't exist or is already active, return early
             return None
 
-        # Atomic operation to enable transaction and update user balance using UserBalance
+        # Atomic operation to enable transaction and update user balance using
+        # UserBalance. Both rows are locked: the balance so the add is serial,
+        # and the transaction so a second fulfilment of the same payment, which
+        # passed the check above before the first committed, adds nothing.
         result = await query_raw_with_schema(
             """
             WITH user_balance_lock AS (
@@ -492,8 +496,13 @@ class UserCreditBase(ABC):
                     ) as balance
             ),
             transaction_check AS (
+                -- Locked, so of several fulfilments racing for one payment only
+                -- the first sees the row inactive: the others wait, re-check the
+                -- row as the first left it (active, re-keyed) and select nothing,
+                -- which makes the rest of this statement a no-op for them.
                 SELECT * FROM {schema_prefix}"CreditTransaction" 
                 WHERE "transactionKey" = $1 AND "userId" = $2 AND "isActive" = false
+                FOR UPDATE
             ),
             balance_update AS (
                 INSERT INTO {schema_prefix}"UserBalance" ("userId", "balance", "updatedAt")
@@ -1290,47 +1299,80 @@ class UserCredit(UserCreditBase):
         successful_transaction = None
         new_transaction_key = None
         charged: stripe.PaymentIntent | None = None
+        declined: stripe.CardError | None = None
+        needs_authentication = False
         for payment_method in payment_methods:
-            if transaction_type == CreditTransactionType.CARD_CHECK:
-                setup_intent = await stripe_call(
-                    stripe.SetupIntent.create_async,
-                    customer=customer_id,
-                    usage="off_session",
-                    confirm=True,
-                    payment_method=payment_method.id,
-                    automatic_payment_methods={
-                        "enabled": True,
-                        "allow_redirects": "never",
-                    },
-                )
-                if setup_intent.status == "succeeded":
-                    successful_transaction = SafeJson({"setup_intent": setup_intent})
-                    new_transaction_key = setup_intent.id
-                    break
-            else:
-                payment_intent = await stripe_call(
-                    stripe.PaymentIntent.create_async,
-                    amount=amount,
-                    currency="usd",
-                    description="AutoGPT Platform Credits",
-                    customer=customer_id,
-                    off_session=True,
-                    confirm=True,
-                    payment_method=payment_method.id,
-                    automatic_payment_methods={
-                        "enabled": True,
-                        "allow_redirects": "never",
-                    },
-                )
-                if payment_intent.status == "succeeded":
-                    successful_transaction = SafeJson(
-                        {"payment_intent": payment_intent}
+            # Stripe raises a decline rather than returning a failed intent, so
+            # catch it here or the first declined card stops the other cards
+            # from being tried.
+            try:
+                if transaction_type == CreditTransactionType.CARD_CHECK:
+                    setup_intent = await stripe_call(
+                        stripe.SetupIntent.create_async,
+                        customer=customer_id,
+                        usage="off_session",
+                        confirm=True,
+                        payment_method=payment_method.id,
+                        automatic_payment_methods={
+                            "enabled": True,
+                            "allow_redirects": "never",
+                        },
                     )
-                    new_transaction_key = payment_intent.id
-                    charged = payment_intent
+                    if setup_intent.status == "succeeded":
+                        successful_transaction = SafeJson(
+                            {"setup_intent": setup_intent}
+                        )
+                        new_transaction_key = setup_intent.id
+                        break
+                    # A card check on a 3D Secure card comes back this way
+                    # instead of raising.
+                    if setup_intent.status == "requires_action":
+                        needs_authentication = True
+                else:
+                    payment_intent = await stripe_call(
+                        stripe.PaymentIntent.create_async,
+                        amount=amount,
+                        currency="usd",
+                        description="AutoGPT Platform Credits",
+                        customer=customer_id,
+                        off_session=True,
+                        confirm=True,
+                        payment_method=payment_method.id,
+                        automatic_payment_methods={
+                            "enabled": True,
+                            "allow_redirects": "never",
+                        },
+                    )
+                    if payment_intent.status == "succeeded":
+                        successful_transaction = SafeJson(
+                            {"payment_intent": payment_intent}
+                        )
+                        new_transaction_key = payment_intent.id
+                        charged = payment_intent
+                        break
+            except stripe.CardError as e:
+                logger.warning(
+                    f"Card {payment_method.id} declined on top-up for user "
+                    f"{user_id}: code={e.code}, "
+                    f"decline_code={e.error.decline_code if e.error else None}"
+                )
+                declined = e
+                # An automatic top-up runs with nobody there and nothing
+                # backing off, so trying every card would multiply declined
+                # off-session charges, which issuers and Radar hold against us.
+                if top_up_type == TopUpType.AUTO:
                     break
 
         if not successful_transaction:
+            if declined is not None:
+                raise CardDeclinedError(
+                    declined.user_message or "Your card was declined.",
+                    needs_authentication=requires_authentication(declined),
+                )
+            if needs_authentication:
+                raise CardDeclinedError(
+                    "Your card was declined.", needs_authentication=True
+                )
             raise ValueError(
                 f"Out of {len(payment_methods)} payment methods tried, none is supported"
             )
@@ -2011,8 +2053,18 @@ def is_tier_downgrade(current: SubscriptionTier, target: SubscriptionTier) -> bo
     return _tier_rank(target) < _tier_rank(current)
 
 
+class CardDeclinedError(Exception):
+    """Every saved card was declined, or the first one on an automatic top-up.
+    The message is Stripe's own reason, which is written for the cardholder and
+    carries no request id."""
+
+    def __init__(self, message: str, needs_authentication: bool = False):
+        super().__init__(message)
+        self.needs_authentication = needs_authentication
+
+
 class PendingChangeUnknown(Exception):
-    """Raised when pending-change state cannot be determined (e.g. LaunchDarkly
+    """Raised when pending-change state cannot be determined (e.g. PostHog
     price-id lookup failed). Propagates past the pending-change cache so the next
     request retries instead of serving a stale `None` for the TTL window."""
 
@@ -2058,7 +2110,7 @@ async def get_user_billing_cycle(user_id: str) -> BillingCycle | None:
     """Return the billing cycle ("monthly"/"yearly") of the user's active sub.
 
     Resolves cycle by matching the active subscription's price ID against the
-    LaunchDarkly-configured monthly/yearly price IDs for the user's current
+    PostHog-configured monthly/yearly price IDs for the user's current
     tier, falling back to scanning every priceable tier (handles the brief
     window during a tier change where DB tier and Stripe price disagree).
     Returns None when there's no Stripe customer, no active sub, or the price
@@ -2637,7 +2689,7 @@ async def _fetch_pending_subscription_change(customer_id: str) -> PendingChange 
     if not price_to_tier:
         logger.warning(
             "get_pending_subscription_change: no Stripe price IDs resolvable for"
-            " BASIC/PRO/MAX/BUSINESS (LaunchDarkly fetch failed?); raising to bypass"
+            " BASIC/PRO/MAX/BUSINESS (PostHog fetch failed?); raising to bypass"
             " the None cache so the next request retries fresh"
         )
         raise PendingChangeUnknown(
@@ -2749,7 +2801,7 @@ async def _resolve_cycle_for_price_id(price_id: str | None) -> BillingCycle | No
 
 
 def _ld_price_key(tier: SubscriptionTier, billing_cycle: BillingCycle) -> str:
-    """Compose the LaunchDarkly key for a tier+cycle.
+    """Compose the feature flag key for a tier+cycle.
 
     Monthly keeps the legacy ``<TIER>`` key (so a flag value flipped from
     monthly-only to also-yearly never breaks an older deploy that still reads
@@ -2764,7 +2816,7 @@ def _ld_price_key(tier: SubscriptionTier, billing_cycle: BillingCycle) -> str:
 async def get_subscription_price_id(
     tier: SubscriptionTier, billing_cycle: BillingCycle = "monthly"
 ) -> str | None:
-    """Return Stripe Price ID for a tier+cycle from LaunchDarkly, cached 60s.
+    """Return Stripe Price ID for a tier+cycle from PostHog, cached 60s.
 
     Reads the ``copilot-tier-stripe-prices`` JSON flag and looks up:
 

@@ -22,6 +22,8 @@ from e2b.exceptions import NotFoundException, TimeoutException
 from pydantic import SecretStr
 
 from backend.copilot import integration_creds
+from backend.copilot.context import bash_command_as_written
+from backend.copilot.sdk.file_ref import text_outside_file_refs
 from backend.data.model import APIKeyCredentials
 
 from ._test_data import make_session
@@ -320,6 +322,106 @@ class TestBashExecSdkToolResultRedirect:
         assert "tool-results/toolu_x.json" in result.message
         assert "Offending fragment: 'cat'" not in result.message
         # Sandbox must not have been invoked at all.
+        sandbox.commands.run.assert_not_called()
+
+    @pytest.mark.asyncio(loop_scope="session")
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            (
+                "cd /root/.claude/projects/-tmp-copilot-abc/abc/tool-results/ && "
+                "python3 -c \"open('toolu_x.json')\""
+            ),
+            "ls -t /root/.claude/projects/*/*/tool-results/",
+        ],
+    )
+    async def test_redirect_on_sdk_dir_without_file_name(self, cmd):
+        tool = _make_tool()
+        session = make_session(user_id=_USER)
+        sandbox = _make_sandbox()
+        with patch(
+            "backend.copilot.tools.bash_exec.get_current_sandbox",
+            return_value=sandbox,
+        ):
+            result = await tool._execute(
+                user_id=_USER,
+                session=session,
+                command=cmd,
+                timeout=10,
+            )
+        assert isinstance(result, ErrorResponse)
+        assert "read_tool_result" in result.message
+        assert "/root/.claude/projects/" in result.message
+        sandbox.commands.run.assert_not_called()
+
+    @pytest.mark.asyncio(loop_scope="session")
+    @pytest.mark.parametrize(
+        "written",
+        [
+            "echo @@agptfile:/home/user/notes.md | wc -l",
+            # The route the redirect hint itself suggests.
+            (
+                "echo @@agptfile:/root/.claude/projects/-tmp-x/"
+                "0f8fad5b-d9cb-469f-a165-70867728950e/tool-results/"
+                "toolu_01.json[1-200] | wc -l"
+            ),
+        ],
+    )
+    async def test_no_redirect_from_agptfile_ref_or_its_content(self, written):
+        """An ``@@agptfile:`` ref, and the text it expands to, are not a
+        sandbox file access: the check reads the command as the model wrote
+        it, minus its refs."""
+        tool = _make_tool()
+        session = make_session(user_id=_USER)
+        sandbox = _make_sandbox(stdout="ok")
+        with (
+            patch(
+                "backend.copilot.tools.bash_exec.get_current_sandbox",
+                return_value=sandbox,
+            ),
+            patch(
+                "backend.copilot.tools.bash_exec.get_integration_env_vars",
+                new=AsyncMock(return_value={}),
+            ),
+            patch(
+                "backend.copilot.tools.bash_exec.get_github_user_git_identity",
+                new=AsyncMock(return_value=None),
+            ),
+            bash_command_as_written(text_outside_file_refs(written)),
+        ):
+            result = await tool._execute(
+                user_id=_USER,
+                session=session,
+                command="echo 'See /root/.claude/projects' | wc -l",
+                timeout=10,
+            )
+        assert isinstance(result, BashExecResponse)
+        sandbox.commands.run.assert_called_once()
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_redirect_on_script_expanded_from_bare_ref(self):
+        """A command that is only an ``@@agptfile:`` ref runs the file it
+        names, so the expanded script is what gets checked."""
+        tool = _make_tool()
+        session = make_session(user_id=_USER)
+        sandbox = _make_sandbox()
+        with (
+            patch(
+                "backend.copilot.tools.bash_exec.get_current_sandbox",
+                return_value=sandbox,
+            ),
+            bash_command_as_written(
+                text_outside_file_refs("@@agptfile:/home/user/run.sh")
+            ),
+        ):
+            result = await tool._execute(
+                user_id=_USER,
+                session=session,
+                command="cat /root/.claude/projects/-tmp-x/a/tool-results/x.json",
+                timeout=10,
+            )
+        assert isinstance(result, ErrorResponse)
+        assert "read_tool_result" in result.message
         sandbox.commands.run.assert_not_called()
 
     @pytest.mark.asyncio(loop_scope="session")
@@ -814,6 +916,10 @@ class _FakeHandle:
             )
         return result
 
+    async def disconnect(self) -> None:
+        self._task.cancel()
+        self._box.disconnects += 1
+
 
 class _FakeCommands:
     def __init__(self, box: "_FakeBox"):
@@ -873,6 +979,7 @@ class _FakeBox:
         self.paused = False
         self.next_process = process
         self.processes: dict[int, _FakeProcess] = {}
+        self.disconnects = 0
         self.sandbox_id = "box-under-test"
         self.set_timeout = AsyncMock(side_effect=self._set_timeout)
         self.get_info = AsyncMock(side_effect=self._get_info)
@@ -1152,6 +1259,68 @@ class TestBashExecE2BTimeouts:
         )
         # E2B's deadline only closes the stream; the tool kills the command.
         assert proc.killed is True
+
+    @pytest.mark.asyncio(loop_scope="session")
+    @pytest.mark.parametrize("stream", ["stdout", "stderr"])
+    async def test_command_that_keeps_printing_is_killed(self, kill_tree, stream):
+        proc = _FakeProcess(
+            [(0.1 * i, stream, "123456") for i in range(1, 100)], runtime=60, code=0
+        )
+        box = _FakeBox(limit=30, process=proc)
+
+        with patch("backend.copilot.tools.bash_exec.MAX_OUTPUT_SIZE", 10):
+            result = await _run(box, timeout=20)
+
+        assert isinstance(result, BashExecResponse)
+        assert (result.timed_out, result.exit_code) == (False, -1)
+        kept = {"stdout": "", "stderr": "", stream: "1234561234"}
+        assert result.stdout == kept["stdout"]
+        note = (
+            "Printed more than 10 characters; redirect output to a file and read "
+            "parts of it"
+        )
+        assert result.stderr == f"{note}\n{kept['stderr']}".rstrip("\n")
+        assert (
+            result.message == f"{note}; it was killed, with every process it started."
+        )
+        # Stopped at the chunk that did not fit, not at the timeout.
+        assert proc.printed == 2
+        assert box.disconnects == 1
+        kill_tree.assert_awaited_once()
+        assert proc.killed is True
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_a_detach_that_fails_still_stops_the_command(self, kill_tree):
+        proc = _FakeProcess(
+            [(0.1 * i, "stdout", "123456") for i in range(1, 100)], runtime=60, code=0
+        )
+        box = _FakeBox(limit=30, process=proc)
+
+        with (
+            patch("backend.copilot.tools.bash_exec.MAX_OUTPUT_SIZE", 10),
+            patch.object(
+                _FakeHandle, "disconnect", AsyncMock(side_effect=RuntimeError("gone"))
+            ),
+        ):
+            result = await _run(box, timeout=20)
+
+        assert isinstance(result, BashExecResponse)
+        assert result.exit_code == -1
+        assert proc.killed is True
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_output_up_to_the_limit_is_returned_whole(self):
+        proc = _FakeProcess(
+            [(0.1, "stdout", "12345"), (0.2, "stdout", "67890")], runtime=0.3, code=0
+        )
+        box = _FakeBox(limit=30, process=proc)
+
+        with patch("backend.copilot.tools.bash_exec.MAX_OUTPUT_SIZE", 10):
+            result = await _run(box, timeout=20)
+
+        assert isinstance(result, BashExecResponse)
+        assert (result.stdout, result.exit_code) == ("1234567890", 0)
+        assert proc.killed is False
 
     @pytest.mark.asyncio(loop_scope="session")
     async def test_timeout_kills_the_children_before_the_shell(self, kill_tree):

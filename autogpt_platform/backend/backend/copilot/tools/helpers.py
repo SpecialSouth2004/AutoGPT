@@ -12,6 +12,7 @@ from pydantic_core import PydanticUndefined
 
 from backend.blocks import BlockType, get_block
 from backend.blocks._base import AnyBlockSchema
+from backend.copilot.capabilities import block_meta
 from backend.copilot.capabilities.block_meta import get_block_provider
 from backend.copilot.constants import (
     COPILOT_NODE_EXEC_ID_SEPARATOR,
@@ -20,7 +21,10 @@ from backend.copilot.constants import (
     MAX_TOOL_WAIT_SECONDS,
 )
 from backend.copilot.context import get_current_permissions, is_unattended_turn
-from backend.copilot.credential_selection import turn_credential_pins
+from backend.copilot.credential_selection import (
+    host_selection_key,
+    turn_credential_pins,
+)
 from backend.copilot.model import ChatSession
 from backend.copilot.permissions import denied_block_providers
 from backend.copilot.providers import SUPPORTED_PROVIDERS
@@ -58,6 +62,7 @@ from backend.util.exceptions import (
     BlockInputError,
     InsufficientBalanceError,
 )
+from backend.util.json import same_json
 from backend.util.request import HTTPClientError
 from backend.util.settings import Settings
 from backend.util.timezone_utils import get_user_timezone_or_utc
@@ -68,6 +73,7 @@ from .ayrshare_managed import not_linked_response as ayrshare_not_linked_respons
 from .ayrshare_managed import provision_for_block as provision_ayrshare_for_block
 from .chat_platform_hint import bot_link_hint
 from .expert_scope import (
+    CredentialScopeSnapshot,
     annotate_expert_grants,
     provider_slug,
     ungranted_credential_hint,
@@ -1007,6 +1013,8 @@ async def unattended_missing_credentials_error(
     session_id: str,
     user_id: str,
     expert_id: str | None,
+    *,
+    credential_scope: CredentialScopeSnapshot | None = None,
 ) -> ErrorResponse:
     """The answer when a turn nobody watches has no credential to run with.
 
@@ -1026,12 +1034,16 @@ async def unattended_missing_credentials_error(
     providers -= {""}
     names = ", ".join(sorted(providers)) or "an integration"
     pinned = await _pinned_account_error(
-        subject, providers, session_id, user_id, expert_id
+        subject, _missing_selection_keys(missing), session_id, user_id, expert_id
     )
     if pinned is not None:
         return pinned
     grant_hint = await ungranted_credential_hint(
-        user_id, expert_id, providers, missing.values()
+        user_id,
+        expert_id,
+        providers,
+        missing.values(),
+        credential_scope=credential_scope,
     )
     logger.warning(
         "Unattended copilot turn in session %s: %s has no %s credential to use",
@@ -1069,6 +1081,22 @@ def _single_provider(providers: set[str]) -> dict[str, Any] | None:
     return {"provider": next(iter(providers))} if len(providers) == 1 else None
 
 
+def _missing_selection_keys(missing: dict[str, dict[str, Any]]) -> set[str]:
+    keys = set()
+    for entry in missing.values():
+        provider = provider_slug(entry.get("provider", ""))
+        if not provider:
+            continue
+        keys.add(provider)
+        if "host_scoped" in entry.get("types", []):
+            keys.update(
+                host_selection_key(provider, url)
+                for url in entry.get("discriminator_values", [])
+                if isinstance(url, str)
+            )
+    return keys
+
+
 async def _pinned_account_error(
     subject: str,
     providers: set[str],
@@ -1087,7 +1115,8 @@ async def _pinned_account_error(
     unfit = sorted(
         p
         for p in pinned
-        if pins[p].id in by_id and not is_per_target_credential(by_id[pins[p].id])
+        if pins[p].id in by_id
+        and (":" in p or not is_per_target_credential(by_id[pins[p].id]))
     )
     if not lost and not unfit:
         return None
@@ -1125,7 +1154,7 @@ async def _pinned_account_error(
             "another account for this schedule, before the next run."
         ),
         error="pinned_credential_missing" if lost else "pinned_credential_unusable",
-        details=_single_provider(set(lost + unfit)),
+        details=_single_provider({p.partition(":")[0] for p in lost + unfit}),
         session_id=session_id,
     ).from_outside()
 
@@ -1194,11 +1223,6 @@ async def prepare_block_for_execution(
     Returns:
         BlockPreparation on success, or a ToolResponseBase error/setup response.
     """
-    from backend.copilot.capabilities.block_meta import (
-        COPILOT_EXCLUDED_BLOCK_IDS,
-        COPILOT_EXCLUDED_BLOCK_TYPES,
-    )
-
     block = get_block(block_id)
     if not block:
         return ErrorResponse(
@@ -1209,29 +1233,9 @@ async def prepare_block_for_execution(
             message=f"Block '{block_id}' is disabled", session_id=session_id
         ).from_outside()
 
-    if (
-        block.block_type in COPILOT_EXCLUDED_BLOCK_TYPES
-        or block.id in COPILOT_EXCLUDED_BLOCK_IDS
-    ):
-        if block.block_type == BlockType.MCP_TOOL:
-            hint = (
-                " Use run_capability on the MCP server entry from find_capability instead — it handles "
-                "MCP server discovery, authentication, and execution."
-            )
-        elif block.block_type == BlockType.AGENT:
-            hint = " Use the `run_agent` tool instead."
-        else:
-            hint = " This block is designed for use within graphs only."
-        return ErrorResponse(
-            message=f"Block '{block.name}' cannot be run directly.{hint}",
-            session_id=session_id,
-        ).from_outside()
-
     # Before credentials: resolving them can provision a managed profile.
-    if denied := _permission_denied(block_id, block.name, session_id):
-        return denied
-    if denied := _provider_denied(block, block_id, session_id):
-        return denied
+    if refusal := block_run_refusal(block, block_id, session_id):
+        return refusal
 
     emit_tool_display_name(block.name)
 
@@ -1325,7 +1329,7 @@ async def prepare_block_for_execution(
         # set up, so its error or grant card stands; the bot is the hint
         # only when nothing of theirs would be.
         owners_fix = bool(grant_hint) or bool(
-            set(turn_credential_pins()) & missing_providers
+            set(turn_credential_pins()) & _missing_selection_keys(missing_entries)
         )
         bot_hint = "" if owners_fix else bot_link_hint(block.name, input_data)
         if not missing_credentials and is_unattended_turn():
@@ -1417,6 +1421,35 @@ async def prepare_block_for_execution(
     )
 
 
+def block_run_refusal(
+    block: AnyBlockSchema, block_id: str, session_id: str
+) -> ErrorResponse | None:
+    """The refusal when this turn may not run *block* directly: a block made
+    for graphs only, or one the session's permissions or provider ceiling
+    keep from the run.  Resuming an approved call answers to it too, since an
+    approval from an earlier turn is no exemption from this one's."""
+    if (
+        block.block_type in block_meta.COPILOT_EXCLUDED_BLOCK_TYPES
+        or block.id in block_meta.COPILOT_EXCLUDED_BLOCK_IDS
+    ):
+        if block.block_type == BlockType.MCP_TOOL:
+            hint = (
+                " Use run_capability on the MCP server entry from find_capability instead — it handles "
+                "MCP server discovery, authentication, and execution."
+            )
+        elif block.block_type == BlockType.AGENT:
+            hint = " Use the `run_agent` tool instead."
+        else:
+            hint = " This block is designed for use within workflows only."
+        return ErrorResponse(
+            message=f"Block '{block.name}' cannot be run directly.{hint}",
+            session_id=session_id,
+        ).from_outside()
+    if denied := _permission_denied(block_id, block.name, session_id):
+        return denied
+    return _provider_denied(block, block_id, session_id)
+
+
 def _permission_denied(
     block_id: str, block_name: str, session_id: str
 ) -> ErrorResponse | None:
@@ -1498,7 +1531,7 @@ async def check_hitl_review(
             for r in existing_reviews
             if r.node_id == synthetic_node_id
             and r.status.value == "WAITING"
-            and r.payload == input_data
+            and same_json(r.payload, input_data)
         ),
         None,
     )
